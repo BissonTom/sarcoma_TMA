@@ -32,6 +32,8 @@ SUPPORTED_EXTENSIONS = {
 class CoreCandidate:
     slide_name: str
     source_geojson: Path
+    polygons: tuple[tuple[tuple[float, float], ...], ...]
+    holes: tuple[tuple[tuple[float, float], ...], ...]
     bounds_x: tuple[float, float]
     bounds_y: tuple[float, float]
     centroid_x: float
@@ -72,6 +74,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--segmenter", default="hest", choices=("hest", "grandqc", "otsu"))
     parser.add_argument("--gpu", type=int, default=0, help="GPU index passed to TRIDENT.")
+    parser.add_argument(
+        "--trident-batch-size",
+        type=int,
+        default=64,
+        help="Base TRIDENT batch size. Used as a fallback if no segmentation-specific batch size is provided.",
+    )
+    parser.add_argument(
+        "--trident-seg-batch-size",
+        type=int,
+        default=512,
+        help="TRIDENT segmentation batch size. Increase this first if your GPU has free memory.",
+    )
+    parser.add_argument(
+        "--trident-max-workers",
+        type=int,
+        default=1,
+        help="Optional number of TRIDENT worker processes for slide-level parallelism.",
+    )
     parser.add_argument("--search-nested", action="store_true", help="Recursively find slides under --slides-dir.")
     parser.add_argument(
         "--wsi-ext",
@@ -145,6 +165,9 @@ def main() -> int:
             job_dir=trident_job_dir,
             gpu=args.gpu,
             segmenter=args.segmenter,
+            trident_batch_size=args.trident_batch_size,
+            trident_seg_batch_size=args.trident_seg_batch_size,
+            trident_max_workers=args.trident_max_workers,
             search_nested=args.search_nested,
             wsi_ext=args.wsi_ext,
         )
@@ -187,7 +210,7 @@ def main() -> int:
             continue
 
         ranked_cores = assign_grid_positions(candidates, row_tolerance_factor=args.row_tolerance_factor)
-        extracted += crop_and_save_cores(
+        written_count, core_paths = crop_and_save_cores(
             slide_path=slide_path,
             ranked_cores=ranked_cores,
             output_dir=output_dir,
@@ -195,6 +218,13 @@ def main() -> int:
             padding=args.padding,
             overwrite=args.overwrite,
         )
+        extracted += written_count
+        if core_paths:
+            render_core_overview_pages(
+                core_paths=core_paths,
+                output_dir=output_dir,
+                slide_stem=f"{args.prefix}{slide_path.stem}",
+            )
 
     print(f"Extracted {extracted} core crops into {output_dir}")
     return 0
@@ -212,7 +242,7 @@ def validate_args(slides_dir: Path, trident_repo: Path) -> None:
 
 def ensure_runtime_dependencies() -> None:
     missing = []
-    for module_name in ("numpy", "openslide", "tifffile"):
+    for module_name in ("numpy", "openslide", "tifffile", "PIL"):
         try:
             __import__(module_name)
         except ImportError:
@@ -296,6 +326,9 @@ def run_trident_segmentation(
     job_dir: Path,
     gpu: int,
     segmenter: str,
+    trident_batch_size: int,
+    trident_seg_batch_size: int | None,
+    trident_max_workers: int | None,
     search_nested: bool,
     wsi_ext: Sequence[str] | None,
 ) -> None:
@@ -312,7 +345,13 @@ def run_trident_segmentation(
         str(gpu),
         "--segmenter",
         segmenter,
+        "--batch_size",
+        str(trident_batch_size),
     ]
+    if trident_seg_batch_size is not None:
+        command.extend(["--seg_batch_size", str(trident_seg_batch_size)])
+    if trident_max_workers is not None:
+        command.extend(["--max_workers", str(trident_max_workers)])
     if search_nested:
         command.append("--search_nested")
     if wsi_ext:
@@ -335,46 +374,140 @@ def extract_candidates_from_geojson(
 
     for feature in features:
         geometry = feature.get("geometry") or {}
-        geom_type = geometry.get("type")
-        coordinates = geometry.get("coordinates", [])
-
-        polygon_rings: list[list[list[float]]] = []
-        if geom_type == "Polygon":
-            polygon_rings = [coordinates]
-        elif geom_type == "MultiPolygon":
-            polygon_rings = list(coordinates)
-        else:
+        annotation_shapes = geometry_to_annotation_shapes(geometry)
+        if not annotation_shapes:
             continue
 
-        for rings in polygon_rings:
-            if not rings:
-                continue
-            outer_ring = rings[0]
-            if len(outer_ring) < 3:
+        polygons: list[tuple[tuple[float, float], ...]] = []
+        holes: list[tuple[tuple[float, float], ...]] = []
+        total_weighted_cx = 0.0
+        total_weighted_cy = 0.0
+        total_area = 0.0
+        all_xs: list[float] = []
+        all_ys: list[float] = []
+
+        for outer_ring, inner_rings in annotation_shapes:
+            normalized_outer = normalize_ring(outer_ring)
+            if len(normalized_outer) < 3:
                 continue
 
-            area = abs(polygon_area(outer_ring))
-            if area < min_core_area:
-                continue
-            if max_core_area is not None and area > max_core_area:
+            outer_area = abs(polygon_area(normalized_outer))
+            if math.isclose(outer_area, 0.0):
                 continue
 
-            xs = [point[0] for point in outer_ring]
-            ys = [point[1] for point in outer_ring]
-            centroid_x, centroid_y = polygon_centroid(outer_ring)
-            candidates.append(
-                CoreCandidate(
-                    slide_name=slide_name,
-                    source_geojson=geojson_path,
-                    bounds_x=(min(xs), max(xs)),
-                    bounds_y=(min(ys), max(ys)),
-                    centroid_x=centroid_x,
-                    centroid_y=centroid_y,
-                    area=area,
-                )
+            outer_cx, outer_cy = polygon_centroid(normalized_outer)
+            total_area += outer_area
+            total_weighted_cx += outer_cx * outer_area
+            total_weighted_cy += outer_cy * outer_area
+            polygons.append(tuple(normalized_outer))
+            all_xs.extend(point[0] for point in normalized_outer)
+            all_ys.extend(point[1] for point in normalized_outer)
+
+            for hole_ring in inner_rings:
+                normalized_hole = normalize_ring(hole_ring)
+                if len(normalized_hole) < 3:
+                    continue
+                hole_area = abs(polygon_area(normalized_hole))
+                if math.isclose(hole_area, 0.0):
+                    continue
+                hole_cx, hole_cy = polygon_centroid(normalized_hole)
+                total_area -= hole_area
+                total_weighted_cx -= hole_cx * hole_area
+                total_weighted_cy -= hole_cy * hole_area
+                holes.append(tuple(normalized_hole))
+                all_xs.extend(point[0] for point in normalized_hole)
+                all_ys.extend(point[1] for point in normalized_hole)
+
+        if total_area < min_core_area:
+            continue
+        if max_core_area is not None and total_area > max_core_area:
+            continue
+        if not polygons or not all_xs or not all_ys:
+            continue
+
+        if math.isclose(total_area, 0.0):
+            centroid_x = sum(all_xs) / len(all_xs)
+            centroid_y = sum(all_ys) / len(all_ys)
+        else:
+            centroid_x = total_weighted_cx / total_area
+            centroid_y = total_weighted_cy / total_area
+
+        candidates.append(
+            CoreCandidate(
+                slide_name=slide_name,
+                source_geojson=geojson_path,
+                polygons=tuple(polygons),
+                holes=tuple(holes),
+                bounds_x=(min(all_xs), max(all_xs)),
+                bounds_y=(min(all_ys), max(all_ys)),
+                centroid_x=centroid_x,
+                centroid_y=centroid_y,
+                area=total_area,
             )
-
+        )
     return candidates
+
+
+def geometry_to_annotation_shapes(
+    geometry: dict[str, object],
+) -> list[tuple[list[tuple[float, float]], list[list[tuple[float, float]]]]]:
+    geom_type = geometry.get("type")
+    coordinates = geometry.get("coordinates", [])
+
+    if geom_type == "Polygon":
+        polygon = parse_polygon_coordinates(coordinates)
+        return [polygon] if polygon is not None else []
+
+    if geom_type == "MultiPolygon":
+        polygons = []
+        for polygon_coords in coordinates:
+            polygon = parse_polygon_coordinates(polygon_coords)
+            if polygon is not None:
+                polygons.append(polygon)
+        return polygons
+
+    return []
+
+
+def parse_polygon_coordinates(
+    coordinates: object,
+) -> tuple[list[tuple[float, float]], list[list[tuple[float, float]]]] | None:
+    if not isinstance(coordinates, list) or not coordinates:
+        return None
+
+    outer_ring = parse_ring(coordinates[0])
+    if outer_ring is None:
+        return None
+
+    holes = []
+    for ring in coordinates[1:]:
+        parsed_ring = parse_ring(ring)
+        if parsed_ring is not None:
+            holes.append(parsed_ring)
+    return outer_ring, holes
+
+
+def parse_ring(points: object) -> list[tuple[float, float]] | None:
+    if not isinstance(points, (list, tuple)):
+        return None
+
+    parsed_points: list[tuple[float, float]] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            return None
+        parsed_points.append((float(point[0]), float(point[1])))
+
+    normalized = normalize_ring(parsed_points)
+    if len(normalized) < 3:
+        return None
+    return normalized
+
+
+def normalize_ring(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+    normalized = [(float(x), float(y)) for x, y in points]
+    if len(normalized) >= 2 and normalized[0] == normalized[-1]:
+        normalized = normalized[:-1]
+    return normalized
 
 
 def polygon_area(points: Sequence[Sequence[float]]) -> float:
@@ -448,13 +581,15 @@ def crop_and_save_cores(
     prefix: str,
     padding: int,
     overwrite: bool,
-) -> int:
+) -> tuple[int, list[Path]]:
     import numpy as np
     import openslide
     import tifffile
+    from PIL import Image, ImageDraw
 
     slide = openslide.OpenSlide(str(slide_path))
     written = 0
+    core_paths: list[Path] = []
     try:
         width, height = slide.dimensions
         stem = slide_path.stem
@@ -475,10 +610,27 @@ def crop_and_save_cores(
             )
             output_path = output_dir / output_name
             if output_path.exists() and not overwrite:
+                core_paths.append(output_path)
                 continue
 
             region = slide.read_region((min_x, min_y), 0, (crop_width, crop_height)).convert("RGB")
-            crop_rgb = np.asarray(region)
+            crop_rgb = np.asarray(region, dtype=np.uint8).copy()
+            mask = Image.new("L", (crop_width, crop_height), 0)
+            draw = ImageDraw.Draw(mask)
+
+            for polygon in ranked_core.candidate.polygons:
+                draw.polygon(
+                    [(x - min_x, y - min_y) for x, y in polygon],
+                    fill=255,
+                )
+            for hole in ranked_core.candidate.holes:
+                draw.polygon(
+                    [(x - min_x, y - min_y) for x, y in hole],
+                    fill=0,
+                )
+
+            mask_array = np.asarray(mask, dtype=np.uint8)
+            crop_rgb[mask_array == 0] = 255
             tifffile.imwrite(
                 output_path,
                 crop_rgb,
@@ -486,10 +638,71 @@ def crop_and_save_cores(
                 compression="deflate",
             )
             written += 1
+            core_paths.append(output_path)
     finally:
         slide.close()
 
-    return written
+    return written, core_paths
+
+
+def render_core_overview_pages(
+    core_paths: Sequence[Path],
+    output_dir: Path,
+    slide_stem: str,
+    rows: int = 5,
+    cols: int = 10,
+) -> None:
+    from PIL import Image, ImageDraw, ImageFont, ImageOps
+
+    if not core_paths:
+        return
+
+    cell_size = 320
+    label_height = 28
+    title_height = 40
+    gutter = 16
+    page_size = rows * cols
+    font = ImageFont.load_default()
+
+    for page_idx in range(0, len(core_paths), page_size):
+        page_paths = core_paths[page_idx : page_idx + page_size]
+        canvas_width = gutter + cols * (cell_size + gutter)
+        canvas_height = title_height + gutter + rows * (cell_size + label_height + gutter)
+        canvas = Image.new("RGB", (canvas_width, canvas_height), (255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+
+        current_page = (page_idx // page_size) + 1
+        total_pages = math.ceil(len(core_paths) / page_size)
+        title = f"{slide_stem} cores overview ({len(core_paths)} total, page {current_page}/{total_pages})"
+        draw.text((gutter, 12), title, fill=(0, 0, 0), font=font)
+
+        for idx, core_path in enumerate(page_paths):
+            grid_row = idx // cols
+            grid_col = idx % cols
+            x0 = gutter + grid_col * (cell_size + gutter)
+            y0 = title_height + gutter + grid_row * (cell_size + label_height + gutter)
+
+            with Image.open(core_path) as image:
+                image = image.convert("RGB")
+                preview = ImageOps.contain(image, (cell_size, cell_size))
+
+            preview_x = x0 + (cell_size - preview.width) // 2
+            preview_y = y0 + (cell_size - preview.height) // 2
+            canvas.paste(preview, (preview_x, preview_y))
+            draw.rectangle(
+                [(x0, y0), (x0 + cell_size - 1, y0 + cell_size - 1)],
+                outline=(80, 80, 80),
+                width=1,
+            )
+            draw.text(
+                (x0, y0 + cell_size + 6),
+                core_path.stem,
+                fill=(0, 0, 0),
+                font=font,
+            )
+
+        output_path = output_dir / f"{slide_stem}_core_overview_p{current_page:02d}.png"
+        canvas.save(output_path)
 
 
 if __name__ == "__main__":
