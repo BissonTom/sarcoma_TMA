@@ -9,6 +9,8 @@
 5. crops each core from the original slide and saves it as a TIFF named like `slide_r03_c07.tiff`.
 
 The script lives at [scripts/extract_tma_cores.py](/home/tb240/sarcoma_TMA/sarcoma_TMA/scripts/extract_tma_cores.py).
+The companion GeoJSON exporter lives at [scripts/export_tma_bboxes_geojson.py](/home/tb240/sarcoma_TMA/sarcoma_TMA/scripts/export_tma_bboxes_geojson.py).
+The CONCH embedding script lives at [scripts/compute_conch_embeddings.py](/home/tb240/sarcoma_TMA/sarcoma_TMA/scripts/compute_conch_embeddings.py).
 
 ## Requirements
 
@@ -47,6 +49,54 @@ python scripts/extract_tma_cores.py \
   --trident-repo /path/to/TRIDENT \
   --trident-job-dir /path/to/existing/trident_job \
   --skip-segmentation
+```
+
+To export QuPath-compatible bounding boxes instead of TIFF crops:
+
+```bash
+python scripts/export_tma_bboxes_geojson.py \
+  --slides-dir /path/to/wsis \
+  --output-dir /path/to/tma_bbox_geojson \
+  --trident-repo /path/to/TRIDENT \
+  --segmenter hest \
+  --gpu 0 \
+  --search-nested
+```
+
+To run TRIDENT CONCH feature extraction on exported core images and write a tracking CSV:
+
+```bash
+python scripts/compute_conch_embeddings.py \
+  --images-dir /path/to/tma_core_tiffs \
+  --output-dir /path/to/conch_embeddings \
+  --trident-repo /path/to/TRIDENT \
+  --patch-encoder conch_v1 \
+  --mag 20 \
+  --patch-size 512
+```
+
+To build a Table 1 CSV with unique case counts per subtype from the tracking CSV:
+
+```bash
+python scripts/build_table1_case_counts.py \
+  --input-csv /path/to/conch_embeddings/conch_embeddings.csv \
+  --output-csv /path/to/table1_case_counts.csv
+```
+
+To train a 3-fold ABMIL subtype classifier on the CONCH embedding bags:
+
+```bash
+/home/tb240/sarcoma_TMA/TRIDENT/.venv/bin/python scripts/train_abmil_subtypes.py \
+  /path/to/conch_embeddings/conch_embeddings.csv \
+  /path/to/abmil_runs/subtype_cv3
+```
+
+To build ABMIL attention galleries split into correct and incorrect predictions:
+
+```bash
+/home/tb240/sarcoma_TMA/TRIDENT/.venv/bin/python scripts/make_abmil_attention_galleries.py \
+  /path/to/abmil_runs/subtype_cv3 \
+  /path/to/abmil_runs/subtype_cv3/galleries
 ```
 
 ## Useful Options
