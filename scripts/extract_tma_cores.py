@@ -83,13 +83,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trident-seg-batch-size",
         type=int,
-        default=512,
+        default=None,
         help="TRIDENT segmentation batch size. Increase this first if your GPU has free memory.",
     )
     parser.add_argument(
         "--trident-max-workers",
         type=int,
-        default=1,
+        default=None,
         help="Optional number of TRIDENT worker processes for slide-level parallelism.",
     )
     parser.add_argument("--search-nested", action="store_true", help="Recursively find slides under --slides-dir.")
