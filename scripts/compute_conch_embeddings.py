@@ -7,6 +7,7 @@ import argparse
 import csv
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -27,6 +28,14 @@ SUPPORTED_EXTENSIONS = {
 }
 
 
+@dataclass(frozen=True)
+class EmbeddingJob:
+    images_dir: Path
+    output_dir: Path
+    trident_job_dir: Path
+    csv_path: Path
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -37,14 +46,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--images-dir",
         type=Path,
+        action="append",
         required=True,
-        help="Directory containing cropped TMA cores or other image files to embed.",
+        help=(
+            "Directory containing cropped TMA cores or other image files to embed. "
+            "Pass this flag multiple times to process multiple corresponding folders in one run. "
+            "If you pass it once and it contains immediate child directories, each child directory "
+            "will be treated as its own embedding job."
+        ),
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
+        action="append",
         required=True,
-        help="Directory where the tracking CSV will be written.",
+        help=(
+            "Directory where the tracking CSV will be written for the corresponding --images-dir. "
+            "Pass once per input directory. If a single parent --images-dir is expanded into child "
+            "jobs automatically, each child job will write into a matching child directory here."
+        ),
     )
     parser.add_argument(
         "--trident-repo",
@@ -55,10 +75,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--trident-job-dir",
         type=Path,
+        action="append",
         default=None,
         help=(
-            "Directory for TRIDENT outputs. Defaults to <output-dir>/trident_job. "
-            "Existing feature files in this directory will be reused."
+            "Directory for TRIDENT outputs for the corresponding --images-dir. "
+            "Defaults to <output-dir>/trident_job. Existing feature files in this directory will be reused. "
+            "Pass once per input directory if you want explicit per-dataset job directories. "
+            "If a single parent --images-dir is expanded into child jobs automatically, this may point "
+            "to a parent job directory and matching child directories will be created underneath it."
         ),
     )
     parser.add_argument(
@@ -138,26 +162,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    images_dir = args.images_dir.resolve()
-    output_dir = args.output_dir.resolve()
     trident_repo = args.trident_repo.resolve()
-    trident_job_dir = (args.trident_job_dir or output_dir / "trident_job").resolve()
-    csv_path = output_dir / args.csv_name
+    validate_common_args(trident_repo, args.patch_size, args.mag, args.overlap)
+    jobs = build_embedding_jobs(
+        images_dirs=args.images_dir,
+        output_dirs=args.output_dir,
+        trident_job_dirs=args.trident_job_dir,
+        csv_name=args.csv_name,
+    )
 
-    validate_args(images_dir, trident_repo, args.patch_size, args.mag, args.overlap)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    trident_job_dir.mkdir(parents=True, exist_ok=True)
-    image_paths = discover_images(images_dir, args.search_nested)
-    if not image_paths:
-        raise FileNotFoundError(f"No supported image files found under {images_dir}")
-    resolved_reader_type = resolve_reader_type(image_paths=image_paths, reader_type=args.reader_type)
-    validate_reader_requirements(resolved_reader_type, args.mpp)
-
-    if not args.skip_feature_extraction:
-        run_trident_feature_extraction(
+    total_rows = 0
+    for job in jobs:
+        total_rows += run_embedding_job(
+            job=job,
             trident_repo=trident_repo,
-            images_dir=images_dir,
-            job_dir=trident_job_dir,
             patch_encoder=args.patch_encoder,
             mag=args.mag,
             patch_size=args.patch_size,
@@ -168,17 +186,179 @@ def main() -> int:
             trident_max_workers=args.trident_max_workers,
             search_nested=args.search_nested,
             wsi_ext=args.wsi_ext,
+            reader_type=args.reader_type,
+            mpp=args.mpp,
+            skip_feature_extraction=args.skip_feature_extraction,
+        )
+
+    print(f"Finished {len(jobs)} embedding job(s) with {total_rows} total CSV rows.")
+    return 0
+
+
+def validate_common_args(
+    trident_repo: Path,
+    patch_size: int,
+    mag: int,
+    overlap: int,
+) -> None:
+    if not trident_repo.is_dir():
+        raise NotADirectoryError(f"--trident-repo does not exist or is not a directory: {trident_repo}")
+    run_script = trident_repo / "run_batch_of_slides.py"
+    if not run_script.exists():
+        raise FileNotFoundError(f"Could not find TRIDENT entrypoint: {run_script}")
+    if patch_size <= 0:
+        raise ValueError("--patch-size must be positive")
+    if mag <= 0:
+        raise ValueError("--mag must be positive")
+    if overlap < 0:
+        raise ValueError("--overlap must be zero or positive")
+
+
+def build_embedding_jobs(
+    images_dirs: Sequence[Path],
+    output_dirs: Sequence[Path],
+    trident_job_dirs: Sequence[Path] | None,
+    csv_name: str,
+) -> list[EmbeddingJob]:
+    if len(images_dirs) == 1 and len(output_dirs) == 1:
+        return build_jobs_from_parent_directory(
+            images_dir=images_dirs[0],
+            output_dir=output_dirs[0],
+            trident_job_dir=trident_job_dirs[0] if trident_job_dirs else None,
+            csv_name=csv_name,
+        )
+
+    if len(images_dirs) != len(output_dirs):
+        raise ValueError(
+            f"Expected the same number of --images-dir and --output-dir values, got "
+            f"{len(images_dirs)} and {len(output_dirs)}."
+        )
+    if trident_job_dirs is not None and len(trident_job_dirs) not in (0, len(images_dirs)):
+        raise ValueError(
+            f"Expected either zero or {len(images_dirs)} --trident-job-dir values, got {len(trident_job_dirs)}."
+        )
+
+    jobs: list[EmbeddingJob] = []
+    for idx, (images_dir, output_dir) in enumerate(zip(images_dirs, output_dirs, strict=True), start=1):
+        resolved_images_dir = images_dir.resolve()
+        resolved_output_dir = output_dir.resolve()
+        if not resolved_images_dir.is_dir():
+            raise NotADirectoryError(
+                f"--images-dir #{idx} does not exist or is not a directory: {resolved_images_dir}"
+            )
+
+        explicit_job_dir = None
+        if trident_job_dirs:
+            explicit_job_dir = trident_job_dirs[idx - 1]
+        resolved_job_dir = (explicit_job_dir or resolved_output_dir / "trident_job").resolve()
+
+        jobs.append(
+            EmbeddingJob(
+                images_dir=resolved_images_dir,
+                output_dir=resolved_output_dir,
+                trident_job_dir=resolved_job_dir,
+                csv_path=resolved_output_dir / csv_name,
+            )
+        )
+    return jobs
+
+
+def build_jobs_from_parent_directory(
+    images_dir: Path,
+    output_dir: Path,
+    trident_job_dir: Path | None,
+    csv_name: str,
+) -> list[EmbeddingJob]:
+    resolved_images_dir = images_dir.resolve()
+    resolved_output_dir = output_dir.resolve()
+    if not resolved_images_dir.is_dir():
+        raise NotADirectoryError(f"--images-dir does not exist or is not a directory: {resolved_images_dir}")
+
+    child_dirs = sorted(path for path in resolved_images_dir.iterdir() if path.is_dir())
+    if not child_dirs:
+        resolved_job_dir = (trident_job_dir or resolved_output_dir / "trident_job").resolve()
+        return [
+            EmbeddingJob(
+                images_dir=resolved_images_dir,
+                output_dir=resolved_output_dir,
+                trident_job_dir=resolved_job_dir,
+                csv_path=resolved_output_dir / csv_name,
+            )
+        ]
+
+    jobs = []
+    resolved_job_parent = trident_job_dir.resolve() if trident_job_dir is not None else None
+    for child_dir in child_dirs:
+        child_output_dir = resolved_output_dir / child_dir.name
+        child_job_dir = (
+            resolved_job_parent / child_dir.name
+            if resolved_job_parent is not None
+            else child_output_dir / "trident_job"
+        )
+        jobs.append(
+            EmbeddingJob(
+                images_dir=child_dir.resolve(),
+                output_dir=child_output_dir.resolve(),
+                trident_job_dir=child_job_dir.resolve(),
+                csv_path=(child_output_dir / csv_name).resolve(),
+            )
+        )
+    return jobs
+
+
+def run_embedding_job(
+    job: EmbeddingJob,
+    trident_repo: Path,
+    patch_encoder: str,
+    mag: int,
+    patch_size: int,
+    overlap: int,
+    gpu: int,
+    trident_batch_size: int,
+    trident_feat_batch_size: int,
+    trident_max_workers: int | None,
+    search_nested: bool,
+    wsi_ext: Sequence[str] | None,
+    reader_type: str,
+    mpp: float | None,
+    skip_feature_extraction: bool,
+) -> int:
+    job.output_dir.mkdir(parents=True, exist_ok=True)
+    job.trident_job_dir.mkdir(parents=True, exist_ok=True)
+    image_paths = discover_images(job.images_dir, search_nested)
+    if not image_paths:
+        raise FileNotFoundError(f"No supported image files found under {job.images_dir}")
+
+    resolved_reader_type = resolve_reader_type(image_paths=image_paths, reader_type=reader_type)
+    validate_reader_requirements(resolved_reader_type, mpp)
+
+    print(f"[info] Processing images from {job.images_dir}")
+    if not skip_feature_extraction:
+        run_trident_feature_extraction(
+            trident_repo=trident_repo,
+            images_dir=job.images_dir,
+            job_dir=job.trident_job_dir,
+            patch_encoder=patch_encoder,
+            mag=mag,
+            patch_size=patch_size,
+            overlap=overlap,
+            gpu=gpu,
+            trident_batch_size=trident_batch_size,
+            trident_feat_batch_size=trident_feat_batch_size,
+            trident_max_workers=trident_max_workers,
+            search_nested=search_nested,
+            wsi_ext=wsi_ext,
             reader_type=resolved_reader_type,
             image_paths=image_paths,
-            mpp=args.mpp,
+            mpp=mpp,
         )
 
     feature_dir = find_trident_feature_dir(
-        job_dir=trident_job_dir,
-        patch_encoder=args.patch_encoder,
-        mag=args.mag,
-        patch_size=args.patch_size,
-        overlap=args.overlap,
+        job_dir=job.trident_job_dir,
+        patch_encoder=patch_encoder,
+        mag=mag,
+        patch_size=patch_size,
+        overlap=overlap,
     )
     if not feature_dir.exists():
         raise FileNotFoundError(
@@ -202,31 +382,9 @@ def main() -> int:
             }
         )
 
-    write_tracking_csv(csv_path, rows)
-    print(f"Wrote {len(rows)} CSV rows to {csv_path}")
-    return 0
-
-
-def validate_args(
-    images_dir: Path,
-    trident_repo: Path,
-    patch_size: int,
-    mag: int,
-    overlap: int,
-) -> None:
-    if not images_dir.is_dir():
-        raise NotADirectoryError(f"--images-dir does not exist or is not a directory: {images_dir}")
-    if not trident_repo.is_dir():
-        raise NotADirectoryError(f"--trident-repo does not exist or is not a directory: {trident_repo}")
-    run_script = trident_repo / "run_batch_of_slides.py"
-    if not run_script.exists():
-        raise FileNotFoundError(f"Could not find TRIDENT entrypoint: {run_script}")
-    if patch_size <= 0:
-        raise ValueError("--patch-size must be positive")
-    if mag <= 0:
-        raise ValueError("--mag must be positive")
-    if overlap < 0:
-        raise ValueError("--overlap must be zero or positive")
+    write_tracking_csv(job.csv_path, rows)
+    print(f"Wrote {len(rows)} CSV rows to {job.csv_path}")
+    return len(rows)
 
 
 def discover_images(images_dir: Path, search_nested: bool) -> list[Path]:
