@@ -21,16 +21,6 @@ from sklearn.preprocessing import label_binarize
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-
-LABEL_ALIASES = {
-    "wd-dd": "wd-ddlps",
-}
-
-EXCLUDED_LABELS = {
-    "ris",
-}
-
-
 @dataclass(frozen=True)
 class BagRecord:
     original_filename: str
@@ -317,18 +307,17 @@ def load_records(input_csv: Path) -> tuple[list[BagRecord], list[str]]:
             raise ValueError(f"Missing required columns in {input_csv}: {', '.join(sorted(missing))}")
         for row in reader:
             embedding_path = Path(row["embedding_path"])
-            normalized_label = normalize_label(row["label"])
-            if embedding_path.is_file() and not should_exclude_label(normalized_label):
+            if embedding_path.is_file():
                 rows.append(row)
 
-    label_names = sorted({normalize_label(row["label"]) for row in rows})
+    label_names = sorted({row["label"] for row in rows})
     label_to_index = {label: index for index, label in enumerate(label_names)}
     records = [
         BagRecord(
             original_filename=row["original_filename"],
             original_path=row["original_path"],
-            label_name=normalize_label(row["label"]),
-            label_index=label_to_index[normalize_label(row["label"])],
+            label_name=row["label"],
+            label_index=label_to_index[row["label"]],
             embedding_path=row["embedding_path"],
         )
         for row in rows
@@ -340,16 +329,6 @@ def infer_feature_dim(embedding_path: Path) -> int:
     with h5py.File(embedding_path, "r") as handle:
         features = handle["features"]
         return int(features.shape[1])
-
-
-def normalize_label(label: str) -> str:
-    return LABEL_ALIASES.get(label, label)
-
-
-def should_exclude_label(label: str) -> bool:
-    return label in EXCLUDED_LABELS
-
-
 class EmbeddingBagDataset(Dataset):
     def __init__(self, records: Sequence[BagRecord]) -> None:
         self.records = list(records)
